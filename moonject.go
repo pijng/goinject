@@ -145,11 +145,11 @@ func addMissingPkgs(importCfgPath string, fileImports []*dst.ImportSpec) error {
 		pkgName := strings.ReplaceAll(fileImport.Path.Value, `"`, "")
 		pkgFound := isPkgInImportCfg(importCfgPath, pkgName)
 
+		fmt.Printf("going to process %s pkg", pkgName)
+
 		if pkgFound {
 			continue
 		}
-
-		fmt.Printf("going to process %s pkg", pkgName)
 
 		if pkgName == "unsafe" {
 			continue
