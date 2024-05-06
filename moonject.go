@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/dave/dst"
@@ -26,15 +25,25 @@ type Modifier interface {
 	Modify(*dst.File) *dst.File
 }
 
-// How to use this code:
+// How to use this library to build you own preprocessor:
 //
-//  1. Compile it somewhere
+//  1. Create a new project for your own preprocessor.
 //
-//     go build injector.go
+//  2. Define a struct that will satisfy [Modifier] interface.
+//     Modifier has only one method [Modify] that must accepts *dst.File as a argument,
+//     and must return a modified *dst.File.
 //
-//  2. Then build your code, while specifying the path to the compiled injector (this file) as an argument to the toolexec flag:
+//     All the modifications you want to make should be called inside your Modify method.
 //
-//     go build -a -toolexec=absolute/path/to/injector/binary main.go
+//  3. In a main function of your preprocessor project simply call:
+//
+//     moonject.Process(YourModifierStruct{})
+//
+//  4. Build your preprocessor with just a `go build`
+//
+//  5. Call a newly compiled preprocessor on your target project like this:
+//
+//     go build -a -toolexec=absolute/path/to/your/preprocessor/binary
 //
 // IMPORTANT: pay attention to the -a flag in the above command.
 // It is required to call compilation of all project files.
@@ -43,15 +52,15 @@ type Modifier interface {
 // to call it as a preprocessor when compiling your project code, the go compiler
 // may not make the changes you need if you have not changed the project code since the last compilation.
 //
-// Generalized description of the approach to preprocessing go code:
-//  1. Check if we are at the right stage of compilation;
-//  2. If not, run the original command and return;
-//  3. Find the file that go is about to compile;
-//  4. Make the changes we need to make to the AST of this file (this won't affect the source code);
-//  5. Write the modified file to the temporary directory;
-//  6. Resolve all missing imports that we added as part of the modification;
-//  7. Substitute the path to the original file with the path to our modified file and pass it to the compiler command;
-//  8. Run the original command with an already substituted file to be compiled.
+// Process function represents the generalized approach to preprocessing go code. It:
+//  1. Checks if we are at the right stage of compilation;
+//  2. If not, runs the original command and return;
+//  3. Finds the file that go is about to compile;
+//  4. Make the changes to the AST of this file (this won't affect the source code);
+//  5. Writes the modified file to the temporary directory;
+//  6. Resolve all missing imports that were added as part of the modification;
+//  7. Substitutes the path to the original file with the path to modified file and pass it to the compiler command;
+//  8. Runs the original command with an already substituted file to be compiled.
 func Process(modifier Modifier) {
 	// os.Args[1] is the name of the current command called go toolchain: asm/compile/link.
 	// os.Args[2:] is command arguments.
@@ -235,27 +244,6 @@ func dstFile(path string) (*dst.File, error) {
 	return f, err
 }
 
-// modifyFileAST is a function that will make all the modifications
-// we need in AST before we write the new content to a temporary file,
-// which will then be compiled in place of the original.
-// This is where we should describe the modification logic.
-//
-// As an example, we find all the functions in the file and add a call
-// to fmt.Prin on the first line of their bodies, but you can do whatever you want
-func modifyFileAST(f *dst.File) *dst.File {
-	for _, decl := range f.Decls {
-		decl, isFunc := decl.(*dst.FuncDecl)
-		if !isFunc {
-			continue
-		}
-
-		span := buildSpan(decl.Name.Name)
-		decl.Body.List = append(span, decl.Body.List...)
-	}
-
-	return f
-}
-
 // resolvePkg will try to collect all the named go packages.
 // It utilizes `go list -deps -export -json -- <pkgName>` command.
 // The most important part here is the -export flag, because it will give us
@@ -357,21 +345,6 @@ func isPkgInImportCfg(importcfgPath string, pkgName string) bool {
 	}
 
 	return false
-}
-
-// Just a simple ast statement that we will substitute into the file as a test.
-// This particular function constructs the `fmt.Println("Calling [funName] func")` call.
-func buildSpan(funcName string) []dst.Stmt {
-	return []dst.Stmt{
-		&dst.ExprStmt{
-			X: &dst.CallExpr{
-				Fun: &dst.Ident{Path: "fmt", Name: "Println"},
-				Args: []dst.Expr{
-					&dst.BasicLit{Kind: token.STRING, Value: strconv.Quote(fmt.Sprintf("Calling [%s] func", funcName))},
-				},
-			},
-		},
-	}
 }
 
 // output writes the content of [out] to the file by the given [fullName] path.
