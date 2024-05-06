@@ -147,6 +147,10 @@ func addMissingPkgs(importCfgPath string, fileImports []*dst.ImportSpec) error {
 			continue
 		}
 
+		if pkgName == "unsafe" {
+			continue
+		}
+
 		packages, err := resolvePkg(pkgName)
 		if err != nil {
 			return fmt.Errorf("failed resolving packages: %w", err)
