@@ -74,6 +74,8 @@ func Process(modifier Modifier) {
 		return
 	}
 
+	fmt.Println(os.Args)
+
 	// We take exactly the last argument from the command arguments
 	// as the path/name of the file to be compiled.
 	//
@@ -147,6 +149,8 @@ func addMissingPkgs(importCfgPath string, fileImports []*dst.ImportSpec) error {
 			continue
 		}
 
+		fmt.Printf("going to process %s pkg", pkgName)
+
 		if pkgName == "unsafe" {
 			continue
 		}
@@ -155,6 +159,8 @@ func addMissingPkgs(importCfgPath string, fileImports []*dst.ImportSpec) error {
 		if err != nil {
 			return fmt.Errorf("failed resolving packages: %w", err)
 		}
+
+		fmt.Printf("trying to find '%s' pkg\n", pkgName)
 
 		pkgPath, pkgFound := packages[pkgName]
 		if !pkgFound {
