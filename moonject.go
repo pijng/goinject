@@ -74,7 +74,7 @@ func Process(modifier Modifier) {
 		return
 	}
 
-	fmt.Println(os.Args)
+	// fmt.Println(os.Args)
 
 	// We take exactly the last argument from the command arguments
 	// as the path/name of the file to be compiled.
@@ -100,7 +100,7 @@ func Process(modifier Modifier) {
 	// Create a temporary directory to where we will write the modified files.
 	// In the future, these files will be substituted for the original ones
 	// when the final compilation command is called.
-	tmpDir, _ := os.MkdirTemp("", "moontrace")
+	tmpDir, _ := os.MkdirTemp("", "moonject")
 	defer os.RemoveAll(tmpDir)
 
 	// Retrieve the path of the modified file we want to compile,
