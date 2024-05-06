@@ -201,6 +201,10 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 		return "", nil, err
 	}
 
+	if f == nil {
+		return "", nil, fmt.Errorf("received nil dst.File for: %s", path)
+	}
+
 	// Make the necessary changes to the AST file
 	f = modifier.Modify(f)
 
