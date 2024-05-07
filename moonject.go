@@ -43,7 +43,7 @@ type Modifier interface {
 //
 //  5. Call a newly compiled preprocessor on your target project like this:
 //
-//     go build -a -toolexec=absolute/path/to/your/preprocessor/binary
+//     go build -a -toolexec="absolute/path/to/your/preprocessor/binary $PWD" main.go
 //
 // IMPORTANT: pay attention to the -a flag in the above command.
 // It is required to call compilation of all project files.
@@ -64,12 +64,18 @@ type Modifier interface {
 func Process(modifier Modifier) {
 	// os.Args[1] is the name of the current command called go toolchain: asm/compile/link.
 	// os.Args[2:] is command arguments.
-	tool, args := os.Args[1], os.Args[2:]
+	tool, args := os.Args[2], os.Args[3:]
 
 	// We do nothing unless it's a direct file compilation.
 	// By checking for -V=full we can avoid redundant steps and just
 	// run original command as is to not interfere compiler.
 	if args[0] == "-V=full" {
+		runCommand(tool, args)
+		return
+	}
+
+	toolName := filepath.Base(tool)
+	if toolName != "compile" {
 		runCommand(tool, args)
 		return
 	}
@@ -86,43 +92,7 @@ func Process(modifier Modifier) {
 	//
 	// When compiling a standard library, several files may be specified in
 	// the arguments, but we don't really care about that because we won't process them anyway.
-	filePathToCompile := args[len(args)-1]
-
-	isGoFile := filepath.Ext(filePathToCompile) == ".go"
-	hasStdFlag := slices.Contains(args, "-std")
-
-	// We skip non .go files and std library files to avoid patching them.
-	if !isGoFile || hasStdFlag {
-		runCommand(os.Args[1], os.Args[2:])
-		return
-	}
-
-	// Create a temporary directory to where we will write the modified files.
-	// In the future, these files will be substituted for the original ones
-	// when the final compilation command is called.
-	tmpDir, _ := os.MkdirTemp("", "moonject")
-	defer os.RemoveAll(tmpDir)
-
-	// Retrieve the path of the modified file we want to compile,
-	// including it's imports.
-	// Read more about imports in [processFile]
-	newFilePathToCompile, fileImports, err := processFile(tmpDir, filePathToCompile, modifier)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Retrieve the path to the importcfg file.
-	// This file is required for `go tool compile` as `-importcfg <path>` flag
-	// to resolve all imports of the compiled file. Our task is to add to this file
-	// all missing imports that were added during our modifications.
-	// Otherwise a compilation will fail with `could not import: <package> (open : no such file or directory)`
-	importCfg, err := importcfgPath(os.Args)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Add all missing packages to importcfg file.
-	err = addMissingPkgs(importCfg, fileImports)
+	filesToCompile, goFilesIndex, err := extractFilesFromPack(args)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -131,11 +101,87 @@ func Process(modifier Modifier) {
 	// The main task is to replace the path to the file we want
 	// to compile (specified by the last argument) with our modified file
 	// from the temporary directory.
-	newArgs := append(os.Args[:len(os.Args)-1], newFilePathToCompile)
+	copiedArgs := make([]string, len(os.Args))
+	copy(copiedArgs, os.Args)
+	newArgs := copiedArgs[:goFilesIndex]
+
+	for _, filePathToCompile := range filesToCompile {
+		isGoFile := filepath.Ext(filePathToCompile) == ".go"
+		hasStdFlag := slices.Contains(args, "-std")
+		pwd := os.Args[1]
+		projectFile := strings.HasPrefix(filePathToCompile, pwd)
+
+		// We skip non .go files and std library files to avoid patching them.
+		if !isGoFile || hasStdFlag || !projectFile {
+			runCommand(tool, args)
+			return
+		}
+
+		log.Printf("found '%s' file to modify\n", filePathToCompile)
+
+		// Create a temporary directory to where we will write the modified files.
+		// In the future, these files will be substituted for the original ones
+		// when the final compilation command is called.
+		tmpDir, _ := os.MkdirTemp("", "moonject")
+		defer os.RemoveAll(tmpDir)
+
+		// Retrieve the path of the modified file we want to compile,
+		// including it's imports.
+		// Read more about imports in [processFile]
+		newFilePathToCompile, fileImports, err := processFile(tmpDir, filePathToCompile, modifier)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		log.Printf("file '%s' was modified and got new path: %s \n", filePathToCompile, newFilePathToCompile)
+
+		// Retrieve the path to the importcfg file.
+		// This file is required for `go tool compile` as `-importcfg <path>` flag
+		// to resolve all imports of the compiled file. Our task is to add to this file
+		// all missing imports that were added during our modifications.
+		// Otherwise a compilation will fail with `could not import: <package> (open : no such file or directory)`
+		importCfg, err := importcfgPath(os.Args)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		log.Printf("received importcfg path of '%s' for '%s' file \n", importCfg, newFilePathToCompile)
+
+		// Add all missing packages to importcfg file.
+		err = addMissingPkgs(importCfg, fileImports)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		newArgs = append(newArgs, newFilePathToCompile)
+	}
 
 	// Run the the original `go tool compile` command with new arguments
 	// to propagate our changes to the compiler.
-	runCommand(newArgs[1], newArgs[2:])
+	runCommand(newArgs[2], newArgs[3:])
+}
+
+func extractFilesFromPack(args []string) ([]string, int, error) {
+	packIndex := -1
+	for i, arg := range args {
+		if arg == "-pack" {
+			packIndex = i
+			break
+		}
+	}
+
+	if packIndex == -1 {
+		return nil, 0, fmt.Errorf("-pack flag is not found")
+	}
+
+	var goFiles []string
+	for i := packIndex + 1; i < len(args); i++ {
+		goFiles = append(goFiles, args[i])
+	}
+
+	goFilesIndex := packIndex + 4
+
+	return goFiles, goFilesIndex, nil
 }
 
 // addMissingPkgs will go through all passed imports and if the importcfg file
@@ -160,9 +206,10 @@ func addMissingPkgs(importCfgPath string, fileImports []*dst.ImportSpec) error {
 
 		pkgPath, pkgFound := packages[pkgName]
 		if !pkgFound {
-			continue
-			// return fmt.Errorf("package '%s' not found after resolving", pkgName)
+			return fmt.Errorf("package '%s' not found after resolving", pkgName)
 		}
+
+		log.Printf("adding '%s' package to '%s' importcfg\n", pkgName, importCfgPath)
 
 		err = addMissingPkgToImportcfg(importCfgPath, pkgName, pkgPath)
 		if err != nil {
@@ -241,7 +288,7 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 // AST node, which we will further modify.
 func dstFile(path string) (*dst.File, error) {
 	fset := token.NewFileSet()
-	astFile, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	astFile, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		return nil, err
 	}
