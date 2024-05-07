@@ -30,7 +30,7 @@ type Modifier interface {
 //  1. Create a new project for your own preprocessor.
 //
 //  2. Define a struct that will satisfy [Modifier] interface.
-//     Modifier has only one method [Modify] that must accepts *dst.File as a argument,
+//     Modifier has only one method [Modify] that must accept *dst.File as an argument,
 //     and must return a modified *dst.File.
 //
 //     All the modifications you want to make should be called inside your Modify method.
@@ -52,15 +52,19 @@ type Modifier interface {
 // to call it as a preprocessor when compiling your project code, the go compiler
 // may not make the changes you need if you have not changed the project code since the last compilation.
 //
+// IMPORTANT: pay attention to $PWD argument in the above command.
+// When calling your preprocessor, you must specify the absolute path to the root of the project you want to
+// compile as the first argument. If you call go build in the root of the project, it is sufficient to specify $PWD.
+//
 // Process function represents the generalized approach to preprocessing go code. It:
 //  1. Checks if we are at the right stage of compilation;
 //  2. If not, runs the original command and return;
-//  3. Finds the file that go is about to compile;
-//  4. Make the changes to the AST of this file (this won't affect the source code);
-//  5. Writes the modified file to the temporary directory;
+//  3. Extract the files that go is about to compile;
+//  4. Make the changes to the AST of all the files (this won't affect the source code);
+//  5. Writes the modified files to the temporary directory;
 //  6. Resolve all missing imports that were added as part of the modification;
-//  7. Substitutes the path to the original file with the path to modified file and pass it to the compiler command;
-//  8. Runs the original command with an already substituted file to be compiled.
+//  7. Substitutes the path to the original files with the path to modified files and pass them to the compiler command;
+//  8. Runs the original command with an already substituted files to be compiled.
 func Process(modifier Modifier) {
 	// os.Args[1] is the name of the current command called go toolchain: asm/compile/link.
 	// os.Args[2:] is command arguments.
@@ -82,42 +86,40 @@ func Process(modifier Modifier) {
 
 	// fmt.Println(os.Args)
 
-	// We take exactly the last argument from the command arguments
-	// as the path/name of the file to be compiled.
+	// Extract paths/file names from the command arguments.
+	// The files are listed as the last arguments after the -pack flag
 	//
 	// Go toolchain calls the `go tool compile` command and lists all files
 	// designated for compilation at the very end of the argument list.
-	// Go compiles the files of the project itself one at a time, so it's safe to
-	// pick the last one.
 	//
-	// When compiling a standard library, several files may be specified in
-	// the arguments, but we don't really care about that because we won't process them anyway.
+	// Returns the index after which to specify modified .go files as a second value.
 	filesToCompile, goFilesIndex, err := extractFilesFromPack(args)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Compose a new set of arguments to `go tool compile`.
-	// The main task is to replace the path to the file we want
-	// to compile (specified by the last argument) with our modified file
-	// from the temporary directory.
+	// Create a new set of arguments for `go tool compile`.
+	// The main task is to replace the paths to the files we
+	// want to compile (specified as last arguments) with our modified
+	// files from the temporary directory.
 	copiedArgs := make([]string, len(os.Args))
 	copy(copiedArgs, os.Args)
 	newArgs := copiedArgs[:goFilesIndex]
 
+	// Go through each file and modify it if it is a project file.
 	for _, filePathToCompile := range filesToCompile {
 		isGoFile := filepath.Ext(filePathToCompile) == ".go"
 		hasStdFlag := slices.Contains(args, "-std")
 		pwd := os.Args[1]
 		projectFile := strings.HasPrefix(filePathToCompile, pwd)
 
-		// We skip non .go files and std library files to avoid patching them.
+		// We skip non .go files, std library files, and non-project files to avoid patching them.
 		if !isGoFile || hasStdFlag || !projectFile {
 			runCommand(tool, args)
 			return
 		}
 
-		log.Printf("found '%s' file to modify\n", filePathToCompile)
+		// log.Printf("found '%s' file to modify\n", filePathToCompile)
 
 		// Create a temporary directory to where we will write the modified files.
 		// In the future, these files will be substituted for the original ones
@@ -133,7 +135,7 @@ func Process(modifier Modifier) {
 			log.Fatal(err)
 		}
 
-		log.Printf("file '%s' was modified and got new path: %s \n", filePathToCompile, newFilePathToCompile)
+		// log.Printf("file '%s' was modified and got new path: %s \n", filePathToCompile, newFilePathToCompile)
 
 		// Retrieve the path to the importcfg file.
 		// This file is required for `go tool compile` as `-importcfg <path>` flag
@@ -145,7 +147,7 @@ func Process(modifier Modifier) {
 			log.Fatal(err)
 		}
 
-		log.Printf("received importcfg path of '%s' for '%s' file \n", importCfg, newFilePathToCompile)
+		// log.Printf("received importcfg path of '%s' for '%s' file \n", importCfg, newFilePathToCompile)
 
 		// Add all missing packages to importcfg file.
 		err = addMissingPkgs(importCfg, fileImports)
@@ -161,6 +163,8 @@ func Process(modifier Modifier) {
 	runCommand(newArgs[2], newArgs[3:])
 }
 
+// extractFilesFromPack extracts all the go files from args.
+// Files are specified after a -pack flag.
 func extractFilesFromPack(args []string) ([]string, int, error) {
 	packIndex := -1
 	for i, arg := range args {
@@ -209,7 +213,7 @@ func addMissingPkgs(importCfgPath string, fileImports []*dst.ImportSpec) error {
 			return fmt.Errorf("package '%s' not found after resolving", pkgName)
 		}
 
-		log.Printf("adding '%s' package to '%s' importcfg\n", pkgName, importCfgPath)
+		// log.Printf("adding '%s' package to '%s' importcfg\n", pkgName, importCfgPath)
 
 		err = addMissingPkgToImportcfg(importCfgPath, pkgName, pkgPath)
 		if err != nil {
