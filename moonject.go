@@ -19,6 +19,7 @@ import (
 	"github.com/dave/dst/decorator"
 	"github.com/dave/dst/decorator/resolver/goast"
 	"github.com/dave/dst/decorator/resolver/guess"
+	"golang.org/x/tools/go/packages"
 )
 
 type Modifier interface {
@@ -106,11 +107,12 @@ func Process(modifier Modifier) {
 	copy(copiedArgs, os.Args)
 	newArgs := copiedArgs[:goFilesIndex]
 
+	pwd := os.Args[1]
+
 	// Go through each file and modify it if it is a project file.
 	for _, filePathToCompile := range filesToCompile {
 		isGoFile := filepath.Ext(filePathToCompile) == ".go"
 		hasStdFlag := slices.Contains(args, "-std")
-		pwd := os.Args[1]
 		projectFile := strings.HasPrefix(filePathToCompile, pwd)
 
 		// We skip non .go files, std library files, and non-project files to avoid patching them.
@@ -247,7 +249,13 @@ func addMissingPkgToImportcfg(importcfgPath string, pkgName string, pkgPath stri
 // processFile returns the path to the modified file, as well as all its relevant imports,
 // which we will need when patching importcfg file.
 func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.ImportSpec, error) {
-	f, err := dstFile(path)
+	// Obtain a packages resolver to automatically manage trivial and non-trivial imports.
+	resolver, err := packagesResolver(path)
+	if err != nil {
+		return "", nil, err
+	}
+
+	f, err := dstFile(path, resolver)
 	if err != nil {
 		return "", nil, err
 	}
@@ -264,7 +272,7 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 	// For example, if the original file does not have an import of the "fmt" package,
 	// but we added code that uses this package, then
 	// NewRestorerWithImports will add "fmt" to the imports list.
-	restorer := decorator.NewRestorerWithImports(path, guess.New())
+	restorer := decorator.NewRestorerWithImports(path, resolver)
 
 	var out bytes.Buffer
 	err = restorer.Fprint(&out, f)
@@ -280,7 +288,7 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 	// Since apparently it is impossible to see changed imports in
 	// the already decorated file. I could be wrong.
 	// But explicit rereading definitely works.
-	f, err = dstFile(newFileName)
+	f, err = dstFile(newFileName, resolver)
 	if err != nil {
 		return "", nil, err
 	}
@@ -290,20 +298,54 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 
 // dstFile parses the .go file at the specified path and returns an
 // AST node, which we will further modify.
-func dstFile(path string) (*dst.File, error) {
+func dstFile(path string, resolver guess.RestorerResolver) (*dst.File, error) {
 	fset := token.NewFileSet()
 	astFile, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		return nil, err
 	}
 
-	dec := decorator.NewDecoratorWithImports(fset, path, goast.New())
+	dec := decorator.NewDecoratorWithImports(fset, path, goast.WithResolver(resolver))
 	f, err := dec.DecorateFile(astFile)
 	if err != nil {
 		return nil, err
 	}
 
 	return f, err
+}
+
+// packagesResolver composes a [guess.RestorerResolver], that can be used in [NewDecoratorWithImports] and
+// [NewRestorerWithImports] to automatically manage imports on file AST modifications.
+func packagesResolver(path string) (guess.RestorerResolver, error) {
+	packagesMap, err := loadPackages(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed composing packages resolver: %w", err)
+	}
+
+	resolver := guess.WithMap(packagesMap)
+
+	return resolver, nil
+}
+
+// loadPackages loads all the packages from the path dir to
+// resolve non-trivial imports later on.
+func loadPackages(path string) (map[string]string, error) {
+	loadedPackages, err := packages.Load(&packages.Config{
+		Dir:  filepath.Dir(path),
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes | packages.NeedSyntax | packages.NeedTypesInfo},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed loading packages: %w", err)
+	}
+
+	pkgs := make(map[string]string)
+	for _, loadedPkg := range loadedPackages {
+		for _, imp := range loadedPkg.Imports {
+			pkgs[imp.PkgPath] = imp.Name
+		}
+	}
+
+	return pkgs, nil
 }
 
 // resolvePkg will try to collect all the named go packages.
