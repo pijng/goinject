@@ -331,8 +331,8 @@ func packagesResolver(path string) (guess.RestorerResolver, error) {
 // resolve non-trivial imports later on.
 func loadPackages(path string) (map[string]string, error) {
 	loadedPackages, err := packages.Load(&packages.Config{
-		Dir:  filepath.Dir(path),
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes | packages.NeedSyntax | packages.NeedTypesInfo},
+		// Dir:  filepath.Dir(path),
+		Mode: packages.NeedName | packages.NeedImports | packages.NeedTypes},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed loading packages: %w", err)
