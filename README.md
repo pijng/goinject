@@ -49,4 +49,5 @@ In this example, `CustomModifier` is a struct that satisfies the `Modifier` inte
 
 ## Demonstration
 
-- [Moonjectlog Preprocessor](https://github.com/pijng/moonjectlog): Moonjectlog is a preprocessor that inserts a simple `fmt.Println` statement at the beginning of each function in a Go project. It demonstrates the usage of Moonject for injecting custom logic into source files.
+- [moonjectlog](https://github.com/pijng/moonjectlog): `moonjectlog` is a preprocessor that inserts a simple `fmt.Println` statement at the beginning of each function in a Go project. It demonstrates the usage of Moonject for injecting custom logic into source files.
+- [go-ifdef](https://github.com/pijng/go-ifdef): `go-ifdef` is a preprocessor that let you use trivial `#ifdef` and `#else` directive based on `GOOS` env variable.
