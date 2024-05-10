@@ -4,7 +4,7 @@ Moonject is a wrapper library for creating Go preprocessors. It provides functio
 
 ## Usage
 
-Moonject allows you to create custom preprocessors by defining a struct that satisfies the `Modifier` interface. This interface has only one method, `Modify`, which accepts a `*dst.File` representing the AST of a Go source file and returns a modified `*dst.File`.
+Moonject allows you to create custom preprocessors by defining a struct that satisfies the `Modifier` interface. This interface has only one method, `Modify`, which accepts a `(*dst.File, *decorator.Decorator, *decorator.Restorer)` representing the AST of a Go source file, file decorator and imports restorer. This method must return a modified `*dst.File`.
 
 ## Process Function
 
@@ -34,7 +34,7 @@ import (
 type CustomModifier struct{}
 
 // Modify implements the Modify method of the Modifier interface
-func (cm CustomModifier) Modify(f *dst.File) *dst.File {
+func (cm CustomModifier) Modify(f *dst.File, dec *decorator.Decorator, res *decorator.Restorer) *dst.File {
 	// Add custom modification logic here
 	return f
 }

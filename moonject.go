@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/parser"
-	"go/token"
 	"io"
 	"log"
 	"os"
@@ -23,7 +22,7 @@ import (
 )
 
 type Modifier interface {
-	Modify(*dst.File) *dst.File
+	Modify(*dst.File, *decorator.Decorator, *decorator.Restorer) *dst.File
 }
 
 // How to use this library to build you own preprocessor:
@@ -31,7 +30,7 @@ type Modifier interface {
 //  1. Create a new project for your own preprocessor.
 //
 //  2. Define a struct that will satisfy [Modifier] interface.
-//     Modifier has only one method [Modify] that must accept *dst.File as an argument,
+//     Modifier has only one method [Modify] that must accept (*dst.File, *decorator.Decorator, *decorator.Restorer) as arguments,
 //     and must return a modified *dst.File.
 //
 //     All the modifications you want to make should be called inside your Modify method.
@@ -255,7 +254,15 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 		return "", nil, err
 	}
 
-	f, err := dstFile(path, resolver)
+	// NewRestorerWithImports is needed to add imports to the file that
+	// are required for the code we injected as part of the modifications.
+	// For example, if the original file does not have an import of the "fmt" package,
+	// but we added code that uses this package, then
+	// NewRestorerWithImports will add "fmt" to the imports list.
+	restorer := decorator.NewRestorerWithImports(path, resolver)
+	decorator := decorator.NewDecoratorWithImports(restorer.Fset, path, goast.WithResolver(resolver))
+
+	f, err := dstFile(path, decorator)
 	if err != nil {
 		return "", nil, err
 	}
@@ -265,14 +272,7 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 	}
 
 	// Make the necessary changes to the AST file
-	f = modifier.Modify(f)
-
-	// NewRestorerWithImports is needed to add imports to the file that
-	// are required for the code we injected as part of the modifications.
-	// For example, if the original file does not have an import of the "fmt" package,
-	// but we added code that uses this package, then
-	// NewRestorerWithImports will add "fmt" to the imports list.
-	restorer := decorator.NewRestorerWithImports(path, resolver)
+	f = modifier.Modify(f, decorator, restorer)
 
 	var out bytes.Buffer
 	err = restorer.Fprint(&out, f)
@@ -288,7 +288,7 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 	// Since apparently it is impossible to see changed imports in
 	// the already decorated file. I could be wrong.
 	// But explicit rereading definitely works.
-	f, err = dstFile(newFileName, resolver)
+	f, err = dstFile(newFileName, decorator)
 	if err != nil {
 		return "", nil, err
 	}
@@ -298,14 +298,12 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 
 // dstFile parses the .go file at the specified path and returns an
 // AST node, which we will further modify.
-func dstFile(path string, resolver guess.RestorerResolver) (*dst.File, error) {
-	fset := token.NewFileSet()
-	astFile, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+func dstFile(path string, dec *decorator.Decorator) (*dst.File, error) {
+	astFile, err := parser.ParseFile(dec.Fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		return nil, err
 	}
 
-	dec := decorator.NewDecoratorWithImports(fset, path, goast.WithResolver(resolver))
 	f, err := dec.DecorateFile(astFile)
 	if err != nil {
 		return nil, err
