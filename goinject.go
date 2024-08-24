@@ -84,7 +84,7 @@ func Process(modifier Modifier) {
 		return
 	}
 
-	// fmt.Println(os.Args)
+	fmt.Println(os.Args)
 
 	// Extract paths/file names from the command arguments.
 	// The files are listed as the last arguments after the -pack flag
@@ -230,13 +230,13 @@ func addMissingPkgs(importCfgPath string, fileImports []*dst.ImportSpec) error {
 func addMissingPkgToImportcfg(importcfgPath string, pkgName string, pkgPath string) error {
 	file, err := os.OpenFile(importcfgPath, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("Error opening file: %w", err)
+		return fmt.Errorf("error opening file: %w", err)
 	}
 	defer file.Close()
 
 	content := fmt.Sprintf("packagefile %s=%s", pkgName, pkgPath)
 	if _, err := file.WriteString(content); err != nil {
-		return fmt.Errorf("Error appending content to file: %w", err)
+		return fmt.Errorf("error appending content to file: %w", err)
 	}
 
 	return nil

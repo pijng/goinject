@@ -1,4 +1,4 @@
-module github.com/pijng/go-inject
+module github.com/pijng/goinject
 
 go 1.22.0
 
