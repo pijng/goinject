@@ -1,10 +1,10 @@
-# go-inject
+# goinject
 
-go-inject is a wrapper library for creating Go preprocessors.
+goinject is a wrapper library for creating Go preprocessors.
 
 ## Usage
 
-go-inject allows you to create custom preprocessors by defining a struct that satisfies the `Modifier` interface. This interface has only one method, `Modify`, which accepts a `(*dst.File, *decorator.Decorator, *decorator.Restorer)` representing the AST of a Go source file, file decorator and imports restorer. This method must return a modified `*dst.File`.
+goinject allows you to create custom preprocessors by defining a struct that satisfies the `Modifier` interface. This interface has only one method, `Modify`, which accepts a `(*dst.File, *decorator.Decorator, *decorator.Restorer)` representing the AST of a Go source file, file decorator and imports restorer. This method must return a modified `*dst.File`.
 
 ## Process Function
 
@@ -21,7 +21,7 @@ The `goinject.Process` function represents the generalized approach to preproces
 
 ## Example
 
-Here's an example of how you can use go-inject to modify a Go source file:
+Here's an example of how you can use goinject to modify a Go source file:
 
 ```go
 package main
@@ -49,5 +49,5 @@ In this example, `CustomModifier` is a struct that satisfies the `Modifier` inte
 
 ## Demonstration
 
-- [moonjectlog](https://github.com/pijng/moonjectlog): `moonjectlog` is a preprocessor that inserts a simple `fmt.Println` statement at the beginning of each function in a Go project. It demonstrates the usage of go-inject for injecting custom logic into source files.
+- [moonjectlog](https://github.com/pijng/moonjectlog): `moonjectlog` is a preprocessor that inserts a simple `fmt.Println` statement at the beginning of each function in a Go project. It demonstrates the usage of goinject for injecting custom logic into source files.
 - [go-ifdef](https://github.com/pijng/go-ifdef): `go-ifdef` is a preprocessor that allows you to use trivial `#ifdef` and `#else` directives based on the GOOS environment variable.
