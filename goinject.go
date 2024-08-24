@@ -84,7 +84,7 @@ func Process(modifier Modifier) {
 		return
 	}
 
-	fmt.Println(os.Args)
+	// fmt.Println(os.Args)
 
 	// Extract paths/file names from the command arguments.
 	// The files are listed as the last arguments after the -pack flag
