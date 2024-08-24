@@ -1,4 +1,4 @@
-module github.com/pijng/moonject
+module github.com/pijng/go-inject
 
 go 1.22.0
 

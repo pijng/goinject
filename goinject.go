@@ -1,4 +1,4 @@
-package moonject
+package goinject
 
 import (
 	"bufio"
@@ -37,7 +37,7 @@ type Modifier interface {
 //
 //  3. In a main function of your preprocessor project simply call:
 //
-//     moonject.Process(YourModifierStruct{})
+//     goinject.Process(YourModifierStruct{})
 //
 //  4. Build your preprocessor with just a `go build`
 //
@@ -125,7 +125,7 @@ func Process(modifier Modifier) {
 		// Create a temporary directory to where we will write the modified files.
 		// In the future, these files will be substituted for the original ones
 		// when the final compilation command is called.
-		tmpDir, _ := os.MkdirTemp("", "moonject")
+		tmpDir, _ := os.MkdirTemp("", "goinject")
 		defer os.RemoveAll(tmpDir)
 
 		// Retrieve the path of the modified file we want to compile,
