@@ -204,7 +204,7 @@ func addMissingPkgs(importCfgPath string, fileImports []*dst.ImportSpec) error {
 			continue
 		}
 
-		packages, err := resolvePkg(pkgName)
+		packages, err := ResolvePkg(pkgName)
 		if err != nil {
 			return fmt.Errorf("failed resolving packages: %w", err)
 		}
@@ -346,12 +346,12 @@ func loadPackages(path string) (map[string]string, error) {
 	return pkgs, nil
 }
 
-// resolvePkg will try to collect all the named go packages.
+// ResolvePkg will try to collect all the named go packages.
 // It utilizes `go list -deps -export -json -- <pkgName>` command.
 // The most important part here is the -export flag, because it will give us
 // the actual path to the compiled package by its name. Then, we can use this path
 // as a value when adding missing package to importcfg in form of `packagefile {pkgName}={path}`
-func resolvePkg(pkgName string) (map[string]string, error) {
+func ResolvePkg(pkgName string) (map[string]string, error) {
 	args := []string{"list", "-json", "-deps", "-export", "--", pkgName}
 
 	cmd := exec.Command("go", args...)
