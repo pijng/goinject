@@ -234,7 +234,7 @@ func addMissingPkgToImportcfg(importcfgPath string, pkgName string, pkgPath stri
 	}
 	defer file.Close()
 
-	content := fmt.Sprintf("packagefile %s=%s", pkgName, pkgPath)
+	content := fmt.Sprintf("packagefile %s=%s\n", pkgName, pkgPath)
 	if _, err := file.WriteString(content); err != nil {
 		return fmt.Errorf("error appending content to file: %w", err)
 	}
