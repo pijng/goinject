@@ -353,7 +353,6 @@ func loadPackages() (map[string]string, error) {
 // the actual path to the compiled package by its name. Then, we can use this path
 // as a value when adding missing package to importcfg in form of `packagefile {pkgName}={path}`
 func ResolvePkg(pkgName string) (map[string]string, error) {
-	fmt.Println("resolving package:", pkgName)
 	args := []string{"list", "-json", "-deps", "-export", "--", pkgName}
 
 	cmd := exec.Command("go", args...)
