@@ -249,7 +249,7 @@ func addMissingPkgToImportcfg(importcfgPath string, pkgName string, pkgPath stri
 // which we will need when patching importcfg file.
 func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.ImportSpec, error) {
 	// Obtain a packages resolver to automatically manage trivial and non-trivial imports.
-	resolver, err := packagesResolver(path)
+	resolver, err := packagesResolver()
 	if err != nil {
 		return "", nil, err
 	}
@@ -314,8 +314,8 @@ func dstFile(path string, dec *decorator.Decorator) (*dst.File, error) {
 
 // packagesResolver composes a [guess.RestorerResolver], that can be used in [NewDecoratorWithImports] and
 // [NewRestorerWithImports] to automatically manage imports on file AST modifications.
-func packagesResolver(path string) (guess.RestorerResolver, error) {
-	packagesMap, err := loadPackages(path)
+func packagesResolver() (guess.RestorerResolver, error) {
+	packagesMap, err := loadPackages()
 	if err != nil {
 		return nil, fmt.Errorf("failed composing packages resolver: %w", err)
 	}
@@ -327,10 +327,11 @@ func packagesResolver(path string) (guess.RestorerResolver, error) {
 
 // loadPackages loads all the packages from the path dir to
 // resolve non-trivial imports later on.
-func loadPackages(path string) (map[string]string, error) {
+func loadPackages() (map[string]string, error) {
 	loadedPackages, err := packages.Load(&packages.Config{
 		// Dir:  filepath.Dir(path),
-		Mode: packages.NeedName | packages.NeedImports | packages.NeedTypes},
+		Mode: packages.NeedName | packages.NeedImports | packages.NeedFiles},
+		"./...",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed loading packages: %w", err)
@@ -352,6 +353,7 @@ func loadPackages(path string) (map[string]string, error) {
 // the actual path to the compiled package by its name. Then, we can use this path
 // as a value when adding missing package to importcfg in form of `packagefile {pkgName}={path}`
 func ResolvePkg(pkgName string) (map[string]string, error) {
+	fmt.Println("resolving package:", pkgName)
 	args := []string{"list", "-json", "-deps", "-export", "--", pkgName}
 
 	cmd := exec.Command("go", args...)
