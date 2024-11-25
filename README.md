@@ -49,5 +49,6 @@ In this example, `CustomModifier` is a struct that satisfies the `Modifier` inte
 
 ## Demonstration
 
-- [moonjectlog](https://github.com/pijng/moonjectlog): `moonjectlog` is a preprocessor that inserts a simple `fmt.Println` statement at the beginning of each function in a Go project. It demonstrates the usage of goinject for injecting custom logic into source files.
+- [go_otel_auto_instrument](https://github.com/pijng/go_otel_auto_instrument): `go_otel_auto_instrument` is a preprocessor that automatically inject Opentelemtry tracing into your Go code.
+- [prep](https://github.com/pijng/prep): `prep` is a small Go tool that enables compile-time function evaluation.
 - [go-ifdef](https://github.com/pijng/go-ifdef): `go-ifdef` is a preprocessor that allows you to use trivial `#ifdef` and `#else` directives based on the GOOS environment variable.
