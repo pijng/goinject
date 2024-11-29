@@ -275,6 +275,14 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 	f = modifier.Modify(f, decorator, restorer)
 
 	var out bytes.Buffer
+
+	// Add /*line */ directive so stack unwinding and caller frames will point to
+	// original source code instead of preprocessed one (especially since we remove the modified code after compilation.)
+	_, err = out.WriteString(fmt.Sprintf("/*line %s:1:1*/\n", path))
+	if err != nil {
+		return "", nil, fmt.Errorf("appending line directive: %w", err)
+	}
+
 	err = restorer.Fprint(&out, f)
 	if err != nil {
 		return "", nil, err
