@@ -21,6 +21,9 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+const toolOffset = 1
+const argsOffset = 2
+
 type Modifier interface {
 	Modify(*dst.File, *decorator.Decorator, *decorator.Restorer) *dst.File
 }
@@ -66,9 +69,9 @@ type Modifier interface {
 //  7. Substitutes the path to the original files with the path to modified files and pass them to the compiler command;
 //  8. Runs the original command with an already substituted files to be compiled.
 func Process(modifier Modifier) {
-	// os.Args[1] is the name of the current command called go toolchain: asm/compile/link.
-	// os.Args[2:] is command arguments.
-	tool, args := os.Args[2], os.Args[3:]
+	// os.Args[toolOffset] is the name of the current command called go toolchain: asm/compile/link.
+	// os.Args[argsOffset:] is command arguments.
+	tool, args := os.Args[toolOffset], os.Args[argsOffset:]
 
 	// We do nothing unless it's a direct file compilation.
 	// By checking for -V=full we can avoid redundant steps and just
@@ -98,6 +101,11 @@ func Process(modifier Modifier) {
 		log.Fatal(err)
 	}
 
+	wd, err := getwd()
+	if err != nil {
+		panic(err)
+	}
+
 	// Create a new set of arguments for `go tool compile`.
 	// The main task is to replace the paths to the files we
 	// want to compile (specified as last arguments) with our modified
@@ -106,13 +114,11 @@ func Process(modifier Modifier) {
 	copy(copiedArgs, os.Args)
 	newArgs := copiedArgs[:goFilesIndex]
 
-	pwd := os.Args[1]
-
 	// Go through each file and modify it if it is a project file.
 	for _, filePathToCompile := range filesToCompile {
 		isGoFile := filepath.Ext(filePathToCompile) == ".go"
 		hasStdFlag := slices.Contains(args, "-std")
-		projectFile := strings.HasPrefix(filePathToCompile, pwd)
+		projectFile := strings.HasPrefix(filePathToCompile, wd)
 
 		// We skip non .go files, std library files, and non-project files to avoid patching them.
 		if !isGoFile || hasStdFlag || !projectFile {
@@ -161,7 +167,7 @@ func Process(modifier Modifier) {
 
 	// Run the the original `go tool compile` command with new arguments
 	// to propagate our changes to the compiler.
-	runCommand(newArgs[2], newArgs[3:])
+	runCommand(newArgs[toolOffset], newArgs[argsOffset:])
 }
 
 // extractFilesFromPack extracts all the go files from args.
@@ -184,7 +190,7 @@ func extractFilesFromPack(args []string) ([]string, int, error) {
 		goFiles = append(goFiles, args[i])
 	}
 
-	goFilesIndex := packIndex + 4
+	goFilesIndex := packIndex + argsOffset + 1
 
 	return goFiles, goFilesIndex, nil
 }
@@ -486,4 +492,21 @@ func runCommand(tool string, args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func getwd() (string, error) {
+	cmd := exec.Command("go", "env", "GOMOD")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("runnning %q: %w", cmd.Args, err)
+	}
+
+	if goMod := strings.TrimSpace(stdout.String()); goMod != "" && goMod != os.DevNull {
+		return filepath.Dir(goMod), nil
+	}
+
+	wd, _ := os.Getwd()
+
+	return "", fmt.Errorf("in %q: %s", wd, "`go env GOMOD` returned a blank string")
 }
