@@ -46,7 +46,7 @@ type Modifier interface {
 //
 //  5. Call a newly compiled preprocessor on your target project like this:
 //
-//     go build -a -toolexec="absolute/path/to/your/preprocessor/binary $PWD" main.go
+//     go build -a -toolexec="absolute/path/to/your/preprocessor/binary" main.go
 //
 // IMPORTANT: pay attention to the -a flag in the above command.
 // It is required to call compilation of all project files.
@@ -54,10 +54,6 @@ type Modifier interface {
 // since the last compilation. So if you make changes to injector.go and then try
 // to call it as a preprocessor when compiling your project code, the go compiler
 // may not make the changes you need if you have not changed the project code since the last compilation.
-//
-// IMPORTANT: pay attention to $PWD argument in the above command.
-// When calling your preprocessor, you must specify the absolute path to the root of the project you want to
-// compile as the first argument. If you call go build in the root of the project, it is sufficient to specify $PWD.
 //
 // Process function represents the generalized approach to preprocessing go code. It:
 //  1. Checks if we are at the right stage of compilation;
