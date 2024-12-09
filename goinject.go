@@ -48,14 +48,7 @@ type Modifier interface {
 //
 //  5. Call a newly compiled preprocessor on your target project like this:
 //
-//     go build -a -toolexec="absolute/path/to/your/preprocessor/binary" main.go
-//
-// IMPORTANT: pay attention to the -a flag in the above command.
-// It is required to call compilation of all project files.
-// Otherwise go compiler will not compile files that have not been changed
-// since the last compilation. So if you make changes to injector.go and then try
-// to call it as a preprocessor when compiling your project code, the go compiler
-// may not make the changes you need if you have not changed the project code since the last compilation.
+//     go build -toolexec="absolute/path/to/your/preprocessor/binary" main.go
 //
 // Process function represents the generalized approach to preprocessing go code. It:
 //  1. Checks if we are at the right stage of compilation;
