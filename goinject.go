@@ -24,6 +24,8 @@ import (
 const toolOffset = 1
 const argsOffset = 2
 
+const goinject = "goinject"
+
 type Modifier interface {
 	Modify(*dst.File, *decorator.Decorator, *decorator.Restorer) *dst.File
 }
@@ -69,11 +71,22 @@ func Process(modifier Modifier) {
 	// os.Args[argsOffset:] is command arguments.
 	tool, args := os.Args[toolOffset], os.Args[argsOffset:]
 
-	// We do nothing unless it's a direct file compilation.
-	// By checking for -V=full we can avoid redundant steps and just
-	// run original command as is to not interfere compiler.
-	if args[0] == "-V=full" {
-		runCommand(tool, args)
+	// The go compiler checks the output of the `compile -V=full` command to determine if there is
+	// an up-to-date version of the current package in the cache, so as not to recompile unnecessarily.
+	// Since goinject does not modify the original files, but rather copies of them, the go compiler assumes
+	// that each call to the build command can work with already cached packages, since the content of the files
+	// and thus their buildid have not changed.
+	// We need to generate our own hash for the buildid, which we will substitute to the compiler as the
+	// result of `compile -V=full`.
+	// The main task is to form a hash by taking the id of the package being compiled (packageID) and enriching it
+	// with the id of the current tool that is called with goinject (toolID).
+	// Thus, compilation with -toolexec will have its own separate cache, which does not overlap with
+	// compilation without -toolexec.
+	if len(args) == 1 && args[0] == "-V=full" {
+		if err := alterToolVersion(tool, args); err != nil {
+			panic(err)
+		}
+
 		return
 	}
 
@@ -127,7 +140,7 @@ func Process(modifier Modifier) {
 		// Create a temporary directory to where we will write the modified files.
 		// In the future, these files will be substituted for the original ones
 		// when the final compilation command is called.
-		tmpDir, _ := os.MkdirTemp("", "goinject")
+		tmpDir, _ := os.MkdirTemp("", goinject)
 		defer os.RemoveAll(tmpDir)
 
 		// Retrieve the path of the modified file we want to compile,
