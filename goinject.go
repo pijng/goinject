@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"go/parser"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,7 +58,14 @@ type Modifier interface {
 //  6. Resolve all missing imports that were added as part of the modification;
 //  7. Substitutes the path to the original files with the path to modified files and pass them to the compiler command;
 //  8. Runs the original command with an already substituted files to be compiled.
-func Process(modifier Modifier) {
+func Process(modifier Modifier, opts ...Option) {
+	config := &config{
+		logger: noopLogger{},
+	}
+	for _, opt := range opts {
+		opt(config)
+	}
+
 	// os.Args[toolOffset] is the name of the current command called go toolchain: asm/compile/link.
 	// os.Args[argsOffset:] is command arguments.
 	tool, args := os.Args[toolOffset], os.Args[argsOffset:]
@@ -100,7 +106,7 @@ func Process(modifier Modifier) {
 	// Returns the index after which to specify modified .go files as a second value.
 	filesToCompile, goFilesIndex, err := extractFilesFromPack(args)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
 	wd, err := getwd()
@@ -116,10 +122,11 @@ func Process(modifier Modifier) {
 	copy(copiedArgs, os.Args)
 	newArgs := copiedArgs[:goFilesIndex]
 
+	hasStdFlag := slices.Contains(args, "-std")
+
 	// Go through each file and modify it if it is a project file.
 	for _, filePathToCompile := range filesToCompile {
 		isGoFile := filepath.Ext(filePathToCompile) == ".go"
-		hasStdFlag := slices.Contains(args, "-std")
 		projectFile := strings.HasPrefix(filePathToCompile, wd)
 
 		// We skip non .go files, std library files, and non-project files to avoid patching them.
@@ -128,23 +135,21 @@ func Process(modifier Modifier) {
 			return
 		}
 
-		// log.Printf("found '%s' file to modify\n", filePathToCompile)
-
 		// Create a temporary directory to where we will write the modified files.
 		// In the future, these files will be substituted for the original ones
 		// when the final compilation command is called.
 		tmpDir, _ := os.MkdirTemp("", goinject)
 		defer os.RemoveAll(tmpDir)
+		config.logger.Printf("Created tmp dir: %s", tmpDir)
 
 		// Retrieve the path of the modified file we want to compile,
 		// including it's imports.
 		// Read more about imports in [processFile]
 		newFilePathToCompile, fileImports, err := processFile(tmpDir, filePathToCompile, modifier)
 		if err != nil {
-			log.Fatal(err)
+			panic(err)
 		}
-
-		// log.Printf("file '%s' was modified and got new path: %s \n", filePathToCompile, newFilePathToCompile)
+		config.logger.Printf("Code modifications completed for file: %s", filePathToCompile)
 
 		// Retrieve the path to the importcfg file.
 		// This file is required for `go tool compile` as `-importcfg <path>` flag
@@ -153,16 +158,15 @@ func Process(modifier Modifier) {
 		// Otherwise a compilation will fail with `could not import: <package> (open : no such file or directory)`
 		importCfg, err := importcfgPath(os.Args)
 		if err != nil {
-			log.Fatal(err)
+			panic(err)
 		}
-
-		// log.Printf("received importcfg path of '%s' for '%s' file \n", importCfg, newFilePathToCompile)
 
 		// Add all missing packages to importcfg file.
 		err = addMissingPkgs(importCfg, fileImports)
 		if err != nil {
-			log.Fatal(err)
+			panic(err)
 		}
+		config.logger.Printf("Missing packages added to importcfg file: %s", importCfg)
 
 		newArgs = append(newArgs, newFilePathToCompile)
 	}
@@ -170,6 +174,7 @@ func Process(modifier Modifier) {
 	// Run the the original `go tool compile` command with new arguments
 	// to propagate our changes to the compiler.
 	runCommand(newArgs[toolOffset], newArgs[argsOffset:])
+	config.logger.Printf("Package compiled")
 }
 
 // extractFilesFromPack extracts all the go files from args.
@@ -221,8 +226,6 @@ func addMissingPkgs(importCfgPath string, fileImports []*dst.ImportSpec) error {
 		if !pkgFound {
 			return fmt.Errorf("package '%s' not found after resolving", pkgName)
 		}
-
-		// log.Printf("adding '%s' package to '%s' importcfg\n", pkgName, importCfgPath)
 
 		err = addMissingPkgToImportcfg(importCfgPath, pkgName, pkgPath)
 		if err != nil {
@@ -475,13 +478,13 @@ func output(fullName string, out io.Reader) {
 
 		err := os.MkdirAll(dirPath, os.ModePerm)
 		if err != nil {
-			log.Fatal(err)
+			panic(err)
 		}
 	}
 
 	err := os.WriteFile(fullName, txt, os.ModePerm)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 }
 
