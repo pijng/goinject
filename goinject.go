@@ -9,10 +9,13 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -137,7 +140,9 @@ func Process(modifier Modifier, opts ...Option) {
 
 	// Obtain a packages resolver to automatically manage trivial and non-trivial imports.
 	// It is created once per package and shared by all files.
-	resolver, err := newPackageNameResolver(filesToCompile)
+	// importcfg lives in $WORK/bNNN/, and $WORK is shared by all invocations of the current build.
+	workDir := filepath.Dir(filepath.Dir(importCfg))
+	resolver, err := newPackageNameResolver(filesToCompile, workDir, wd)
 	if err != nil {
 		panic(err)
 	}
@@ -156,7 +161,7 @@ func Process(modifier Modifier, opts ...Option) {
 	// and the original file order is preserved for the compiler:
 	// package-level variable initialization order across files depends on it.
 	newFilePaths := make([]string, len(filesToCompile))
-	filesImports := make([][]*dst.ImportSpec, len(filesToCompile))
+	filesImports := make([][]string, len(filesToCompile))
 	errs := make([]error, len(filesToCompile))
 
 	var wg sync.WaitGroup
@@ -186,7 +191,7 @@ func Process(modifier Modifier, opts ...Option) {
 	newArgs = append(newArgs, newFilePaths...)
 
 	// Add all missing packages to importcfg file.
-	err = addMissingPkgs(importCfg, slices.Concat(filesImports...))
+	err = addMissingPkgs(importCfg, workDir, slices.Concat(filesImports...))
 	if err != nil {
 		panic(err)
 	}
@@ -249,55 +254,118 @@ func extractFilesFromPack(args []string) ([]string, int, error) {
 }
 
 // addMissingPkgs ensures that all provided import paths are declared in the importcfg file.
-// For each import, if it's not already present in importcfg and is not "unsafe",
-// it resolves the package path and appends it to importcfg.
-func addMissingPkgs(importCfgPath string, fileImports []*dst.ImportSpec) error {
-	for _, fileImport := range fileImports {
-		pkgName := strings.ReplaceAll(fileImport.Path.Value, `"`, "")
-		pkgFound := isPkgInImportCfg(importCfgPath, pkgName)
+// Imports that are neither present in importcfg nor "unsafe" are taken from the export paths shared
+// by the other compile invocations of the build (see [buildExportsFile]); the rest are resolved with
+// a single `go list` call and shared in turn. All entries are appended to importcfg in a single write.
+func addMissingPkgs(importCfgPath, workDir string, importPaths []string) error {
+	present, err := importCfgPackages(importCfgPath)
+	if err != nil {
+		return err
+	}
 
-		if pkgFound {
+	var missing []string
+	for _, importPath := range importPaths {
+		if importPath == "unsafe" || present[importPath] || slices.Contains(missing, importPath) {
 			continue
 		}
+		missing = append(missing, importPath)
+	}
 
-		if pkgName == "unsafe" {
-			continue
+	if len(missing) == 0 {
+		return nil
+	}
+
+	exportsPath := filepath.Join(workDir, buildExportsFile)
+	exports, err := readSharedExports(exportsPath)
+	if err != nil {
+		return err
+	}
+
+	var unresolved []string
+	for _, importPath := range missing {
+		if _, ok := exports[importPath]; !ok {
+			unresolved = append(unresolved, importPath)
 		}
+	}
 
-		packages, err := ResolvePkg(pkgName)
+	if len(unresolved) > 0 {
+		resolved, err := ResolvePkg(unresolved...)
 		if err != nil {
 			return fmt.Errorf("failed resolving packages: %w", err)
 		}
 
-		pkgPath, pkgFound := packages[pkgName]
-		if !pkgFound {
-			return fmt.Errorf("package '%s' not found after resolving", pkgName)
+		var shared strings.Builder
+		for _, importPath := range unresolved {
+			export, ok := resolved[importPath]
+			if !ok {
+				return fmt.Errorf("package '%s' not found after resolving", importPath)
+			}
+			exports[importPath] = export
+			fmt.Fprintf(&shared, "%s\t%s\n", importPath, export)
 		}
 
-		err = addMissingPkgToImportcfg(importCfgPath, pkgName, pkgPath)
-		if err != nil {
-			return fmt.Errorf("failed adding pkg '%s' to importcfg: %w", pkgName, err)
+		if err := appendToFile(exportsPath, shared.String()); err != nil {
+			return fmt.Errorf("sharing export paths: %w", err)
 		}
+	}
+
+	var entries strings.Builder
+	for _, importPath := range missing {
+		fmt.Fprintf(&entries, "packagefile %s=%s\n", importPath, exports[importPath])
+	}
+
+	if err := appendToFile(importCfgPath, entries.String()); err != nil {
+		return fmt.Errorf("appending to importcfg: %w", err)
 	}
 
 	return nil
 }
 
-// addMissingPkgToImportcfg appends a packagefile entry to the given importcfg file,
-// allowing the Go compiler to resolve the specified package during compilation and linking.
-func addMissingPkgToImportcfg(importcfgPath string, pkgName string, pkgPath string) error {
-	file, err := os.OpenFile(importcfgPath, os.O_APPEND|os.O_WRONLY, 0644)
+// buildExportsFile is the file in the build's $WORK directory where compile invocations share the export
+// data paths of packages added by modifications. Modifications tend to add the same packages everywhere,
+// so each of them is resolved with `go list -export` about once per build instead of once per package.
+// Within a build a package has a single export path, so entries never conflict.
+//
+// The file is an append-only log of "importPath\texport\n" lines: every invocation appends the entries
+// it resolved with a single write, so concurrent invocations never lose each other's entries.
+const buildExportsFile = "goinject-exports"
+
+// readSharedExports reads the export paths shared through [buildExportsFile].
+// Only complete lines are used: the last one may still be being appended by another invocation.
+func readSharedExports(path string) (map[string]string, error) {
+	exports := make(map[string]string)
+
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return exports, nil
+	}
 	if err != nil {
-		return fmt.Errorf("error opening file: %w", err)
-	}
-	defer file.Close()
-
-	content := fmt.Sprintf("packagefile %s=%s\n", pkgName, pkgPath)
-	if _, err := file.WriteString(content); err != nil {
-		return fmt.Errorf("error appending content to file: %w", err)
+		return nil, fmt.Errorf("reading shared export paths: %w", err)
 	}
 
-	return nil
+	data = data[:bytes.LastIndexByte(data, '\n')+1]
+	for _, line := range strings.Split(string(data), "\n") {
+		if importPath, export, ok := strings.Cut(line, "\t"); ok {
+			exports[importPath] = export
+		}
+	}
+
+	return exports, nil
+}
+
+// appendToFile appends content to the file at path with a single write, creating the file if needed.
+func appendToFile(path, content string) error {
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+
+	_, err = file.WriteString(content)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+
+	return err
 }
 
 // processFile parses and modifies the AST of a Go source file, writes the updated
@@ -307,7 +375,7 @@ func addMissingPkgToImportcfg(importcfgPath string, pkgName string, pkgPath stri
 // It automatically manages import resolution and injects missing imports required
 // by modifications. It also adds `/*line*/` directives to preserve accurate
 // compiler errors and stack traces that refer back to the original file.
-func processFile(tmpDir string, path string, modifier Modifier, resolver *packageNameResolver) (string, []*dst.ImportSpec, error) {
+func processFile(tmpDir string, path string, modifier Modifier, resolver *packageNameResolver) (string, []string, error) {
 	// NewRestorerWithImports ensures newly required imports (e.g., "fmt")
 	// are added to the file if they're used in the injected code but
 	// missing from the original source.
@@ -348,17 +416,38 @@ func processFile(tmpDir string, path string, modifier Modifier, resolver *packag
 
 	// Write our modified file to the temporary directory we created at the beginning.
 	newFileName := tmpDir + string(os.PathSeparator) + filepath.Base(path)
-	output(newFileName, &out)
+	if err := os.WriteFile(newFileName, out.Bytes(), 0o644); err != nil {
+		return "", nil, err
+	}
 
-	// Re-read the modified file to retrieve updated imports.
-	// The decorator might not reflect changes to imports made during modification,
-	// so reading the file again ensures we capture the correct list.
-	f, err = dstFile(newFileName, decorator)
+	// Collect the imports of the resulting code: the decorator does not reflect imports
+	// added by the restorer, so they are read from the printed output.
+	importPaths, err := fileImportPaths(newFileName, out.Bytes())
 	if err != nil {
 		return "", nil, err
 	}
 
-	return newFileName, f.Imports, nil
+	return newFileName, importPaths, nil
+}
+
+// fileImportPaths parses only the import declarations of a Go source file and returns their paths.
+// src is handled as in [parser.ParseFile]: if it is nil, the file is read from path.
+func fileImportPaths(path string, src any) ([]string, error) {
+	f, err := parser.ParseFile(token.NewFileSet(), path, src, parser.ImportsOnly)
+	if err != nil {
+		return nil, err
+	}
+
+	importPaths := make([]string, 0, len(f.Imports))
+	for _, spec := range f.Imports {
+		importPath, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			return nil, fmt.Errorf("parsing import %s in %s: %w", spec.Path.Value, path, err)
+		}
+		importPaths = append(importPaths, importPath)
+	}
+
+	return importPaths, nil
 }
 
 // addLineDirectives prefixes every top-level declaration and every statement of a block or
@@ -458,32 +547,114 @@ type packageNameResolver struct {
 	names map[string]string
 }
 
-// newPackageNameResolver creates a resolver preloaded with the names of all packages imported by files,
-// using a single `go list` call. Imports added by modifications are resolved lazily in [ResolvePackage].
-func newPackageNameResolver(files []string) (*packageNameResolver, error) {
-	fset := token.NewFileSet()
-	var importPaths []string
+// newPackageNameResolver creates a resolver preloaded with the names of the packages of the build
+// when they are already available (see [loadBuildPackageNames]). Imports of files missing from that list
+// are resolved with a single `go list` call; imports added by modifications are resolved lazily in [ResolvePackage].
+func newPackageNameResolver(files []string, workDir, modRoot string) (*packageNameResolver, error) {
+	names, err := loadBuildPackageNames(workDir, modRoot)
+	if err != nil {
+		return nil, fmt.Errorf("failed composing packages resolver: %w", err)
+	}
+	if names == nil {
+		names = make(map[string]string)
+	}
+
+	var missing []string
 	for _, file := range files {
-		f, err := parser.ParseFile(fset, file, nil, parser.ImportsOnly)
+		importPaths, err := fileImportPaths(file, nil)
 		if err != nil {
 			return nil, err
 		}
 
-		for _, spec := range f.Imports {
-			importPath := strings.Trim(spec.Path.Value, `"`)
+		for _, importPath := range importPaths {
 			// "C" is the cgo pseudo-package, unknown to `go list`.
-			if importPath != "C" && !slices.Contains(importPaths, importPath) {
-				importPaths = append(importPaths, importPath)
+			if _, ok := names[importPath]; ok || importPath == "C" || slices.Contains(missing, importPath) {
+				continue
 			}
+			missing = append(missing, importPath)
 		}
 	}
 
-	names, err := loadPackageNames(importPaths)
+	missingNames, err := loadPackageNames(missing)
 	if err != nil {
 		return nil, fmt.Errorf("failed composing packages resolver: %w", err)
 	}
+	maps.Copy(names, missingNames)
 
 	return &packageNameResolver{names: names}, nil
+}
+
+// buildPackageNamesFile is the file in the build's $WORK directory that holds the names of the packages
+// of the main module and their dependencies. $WORK is created for every `go build` invocation and removed
+// after it, so the list is shared by all compile invocations of a build and never outlives it.
+const buildPackageNamesFile = "goinject-pkgnames"
+
+// packageNameFormat is the `go list -f` template parsed by [parsePackageNames].
+// Test variants have import paths like "p [p.test]", hence the tab separator.
+const packageNameFormat = "{{.ImportPath}}\t{{.Name}}"
+
+// loadBuildPackageNames returns the names of all packages of the main module, including their tests,
+// and of all their dependencies, shared by the compile invocations of a build through workDir.
+//
+// Only the first invocation lists them, and publishes the list atomically, so readers see either
+// no list or the complete one. Invocations running concurrently with it do not wait: they get nil and
+// resolve their own imports, which is cheaper than waiting for the list of the whole module.
+// Later invocations, which are the majority, read the list instead of running `go list`.
+func loadBuildPackageNames(workDir, modRoot string) (map[string]string, error) {
+	namesPath := filepath.Join(workDir, buildPackageNamesFile)
+	if data, err := os.ReadFile(namesPath); err == nil {
+		return parsePackageNames(data), nil
+	}
+
+	// The lock is never released: it only elects the single invocation that lists the packages.
+	// If that invocation fails, the others keep resolving their own imports.
+	lock, err := os.OpenFile(namesPath+".lock", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if errors.Is(err, fs.ErrExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	lock.Close()
+
+	data, err := goList(modRoot, "-e", "-deps", "-test", "-f", packageNameFormat, "./...")
+	if err != nil {
+		return nil, err
+	}
+
+	if err := writeFileAtomic(namesPath, data); err != nil {
+		return nil, fmt.Errorf("sharing package names: %w", err)
+	}
+
+	return parsePackageNames(data), nil
+}
+
+// writeFileAtomic writes data to a temporary file next to path and renames it to path,
+// so concurrent readers see either no file or the complete one.
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		// On Windows renaming over an existing file fails: another invocation already published the list.
+		if _, statErr := os.Stat(path); statErr == nil {
+			return nil
+		}
+		return err
+	}
+
+	return nil
 }
 
 // ResolvePackage returns the name of the package with the given import path.
@@ -517,13 +688,37 @@ func (r *packageNameResolver) ResolvePackage(importPath string) (string, error) 
 // `go list -find` only locates the packages, without resolving their dependencies, which keeps it cheap.
 // Packages that cannot be found are omitted.
 func loadPackageNames(importPaths []string) (map[string]string, error) {
-	names := make(map[string]string, len(importPaths))
 	if len(importPaths) == 0 {
-		return names, nil
+		return make(map[string]string), nil
 	}
 
-	args := append([]string{"list", "-e", "-find", "-f", "{{.ImportPath}} {{.Name}}", "--"}, importPaths...)
-	cmd := exec.Command("go", args...)
+	args := append([]string{"-e", "-find", "-f", packageNameFormat, "--"}, importPaths...)
+	data, err := goList("", args...)
+	if err != nil {
+		return nil, err
+	}
+
+	return parsePackageNames(data), nil
+}
+
+// parsePackageNames parses `go list` output produced with [packageNameFormat].
+// Packages without a name (not found or broken) are omitted.
+func parsePackageNames(data []byte) map[string]string {
+	names := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		importPath, name, _ := strings.Cut(line, "\t")
+		if name != "" {
+			names[importPath] = name
+		}
+	}
+
+	return names
+}
+
+// goList runs `go list` with args in dir (the current directory if empty) and returns its stdout.
+func goList(dir string, args ...string) ([]byte, error) {
+	cmd := exec.Command("go", append([]string{"list"}, args...)...)
+	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -531,24 +726,18 @@ func loadPackageNames(importPaths []string) (map[string]string, error) {
 		return nil, fmt.Errorf("running %q: %w: %s", cmd.Args, err, stderr.String())
 	}
 
-	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
-		importPath, name, _ := strings.Cut(line, " ")
-		if name != "" {
-			names[importPath] = name
-		}
-	}
-
-	return names, nil
+	return stdout.Bytes(), nil
 }
 
 // ResolvePkg attempts to collect and return the paths to the compiled Go packages
-// corresponding to the given package name. It runs the `go list -deps -export -json -- <pkgName>`
-// command to retrieve package details, where the `-export` flag is crucial for obtaining
-// the actual path to the compiled package by its name.
+// corresponding to the given package names and all their dependencies. It runs a single
+// `go list -deps -export -json -- <pkgNames...>` command to retrieve package details, where the `-export`
+// flag is crucial for obtaining the actual path to the compiled package by its name.
 // Special handling is applied for the "unsafe" package since it doesn't follow the
 // standard module export format.
-func ResolvePkg(pkgName string) (map[string]string, error) {
-	args := []string{"list", "-json", "-deps", "-export", "--", pkgName}
+func ResolvePkg(pkgNames ...string) (map[string]string, error) {
+	// Only the decoded fields are requested: full `go list -json` output is an order of magnitude larger.
+	args := append([]string{"list", "-json=ImportPath,Export,Standard", "-deps", "-export", "--"}, pkgNames...)
 
 	cmd := exec.Command("go", args...)
 	var stdout bytes.Buffer
@@ -560,7 +749,6 @@ func ResolvePkg(pkgName string) (map[string]string, error) {
 	type listItem struct {
 		ImportPath string // The import path of the package
 		Export     string // The path to its archive, if any
-		BuildID    string // The build ID for the package
 		Standard   bool   // Whether this is from the standard library
 	}
 	var items []listItem
@@ -614,54 +802,34 @@ func importcfgPath(args []string) (string, error) {
 	return "", fmt.Errorf("failed retrieving importcfg")
 }
 
-// isPkgInImportCfg checks if the specified package name is present in the given importcfg file.
-// It opens the importcfg file at the provided [importcfgPath], scans its contents,
-// and looks for a line matching the pattern `packagefile {pkgName}=`.
-func isPkgInImportCfg(importcfgPath string, pkgName string) bool {
+// importCfgPackages returns the set of packages declared in the given importcfg file.
+// A typical importcfg file looks like this:
+//
+//	# import config
+//	packagefile fmt=/var/folders/jt/j7pkdpss14s693b7hgk_d2z00000gs/T/go-build2972637916/b002/_pkg_.a
+func importCfgPackages(importcfgPath string) (map[string]bool, error) {
 	file, err := os.Open(importcfgPath)
 	if err != nil {
-		return false
+		return nil, fmt.Errorf("error opening importcfg: %w", err)
 	}
 	defer file.Close()
 
+	packages := make(map[string]bool)
 	scanner := bufio.NewScanner(file)
-
-	// A typical importcfg file might look like this:
-	//
-	// # import config
-	// packagefile fmt=/var/folders/jt/j7pkdpss14s693b7hgk_d2z00000gs/T/go-build2972637916/b002/_pkg_.a
-	//
-	// The function returns true if it finds a line with the packagefile for the given package,
-	// and false otherwise.
-	pattern := fmt.Sprintf("packagefile %s=", pkgName)
-
 	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, pattern) {
-			return true
+		entry, ok := strings.CutPrefix(scanner.Text(), "packagefile ")
+		if !ok {
+			continue
+		}
+		if importPath, _, ok := strings.Cut(entry, "="); ok {
+			packages[importPath] = true
 		}
 	}
-
-	return false
-}
-
-// output writes the content of [out] to the file by the given [fullName] path.
-func output(fullName string, out io.Reader) {
-	txt, _ := io.ReadAll(out)
-
-	if _, err := os.Stat(fullName); os.IsNotExist(err) {
-		dirPath := filepath.Dir(fullName)
-
-		err := os.MkdirAll(dirPath, os.ModePerm)
-		if err != nil {
-			panic(err)
-		}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading importcfg: %w", err)
 	}
 
-	err := os.WriteFile(fullName, txt, 0o644)
-	if err != nil {
-		panic(err)
-	}
+	return packages, nil
 }
 
 // runCommand executes the specified Go toolchain command with the provided arguments.
