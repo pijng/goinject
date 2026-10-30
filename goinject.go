@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"os/exec"
@@ -18,7 +20,6 @@ import (
 	"github.com/dave/dst/decorator"
 	"github.com/dave/dst/decorator/resolver/goast"
 	"github.com/dave/dst/decorator/resolver/guess"
-	"golang.org/x/tools/go/packages"
 )
 
 const toolOffset = 1
@@ -90,9 +91,10 @@ func Process(modifier Modifier, opts ...Option) {
 		return
 	}
 
-	toolName := filepath.Base(tool)
+	// On Windows the toolchain binaries carry an .exe suffix.
+	toolName := strings.TrimSuffix(filepath.Base(tool), ".exe")
 	if toolName != "compile" {
-		runCommand(tool, args)
+		exitOnError(runCommand(tool, args))
 		return
 	}
 
@@ -129,46 +131,62 @@ func Process(modifier Modifier, opts ...Option) {
 
 	// Skip preprocessing all non relevant files
 	if hasNonRelevantFiles(args, filesToCompile, wd) {
-		runCommand(tool, args)
+		exitOnError(runCommand(tool, args))
 		return
+	}
+
+	// Obtain a packages resolver to automatically manage trivial and non-trivial imports.
+	// It is created once per package and shared by all files.
+	resolver, err := newPackageNameResolver(filesToCompile)
+	if err != nil {
+		panic(err)
 	}
 
 	// Creates a temporary directory where modified files will be written.
 	// These files will later replace the original ones during the final compilation.
 	// The temporary directory must be cleaned up after use.
-	tmpDir, _ := os.MkdirTemp("", goinject)
+	tmpDir, err := os.MkdirTemp("", goinject)
+	if err != nil {
+		panic(fmt.Errorf("creating tmp dir: %w", err))
+	}
 	defer os.RemoveAll(tmpDir)
 	config.logger.Printf("Created tmp dir: %s", tmpDir)
 
-	var mu sync.Mutex
+	// Every goroutine writes only to its own index, so no locking is needed,
+	// and the original file order is preserved for the compiler:
+	// package-level variable initialization order across files depends on it.
+	newFilePaths := make([]string, len(filesToCompile))
+	filesImports := make([][]*dst.ImportSpec, len(filesToCompile))
+	errs := make([]error, len(filesToCompile))
+
 	var wg sync.WaitGroup
 	wg.Add(len(filesToCompile))
 
-	var fileImports []*dst.ImportSpec
-
 	// Modify each file.
-	for _, filePathToCompile := range filesToCompile {
+	for i, filePathToCompile := range filesToCompile {
 		go func() {
-			defer wg.Add(-1)
+			defer wg.Done()
 
 			// Retrieve the path of the modified file we want to compile, including it's imports.
 			// Read more about imports in [processFile]
-			var newFilePathToCompile string
-			newFilePathToCompile, fileImports, err = processFile(tmpDir, filePathToCompile, modifier)
-			if err != nil {
-				panic(err)
+			newFilePaths[i], filesImports[i], errs[i] = processFile(tmpDir, filePathToCompile, modifier, resolver)
+			if errs[i] != nil {
+				errs[i] = fmt.Errorf("processing %s: %w", filePathToCompile, errs[i])
+				return
 			}
 			config.logger.Printf("Code modifications completed for file: %s", filePathToCompile)
-
-			mu.Lock()
-			newArgs = append(newArgs, newFilePathToCompile)
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 
+	if err := errors.Join(errs...); err != nil {
+		panic(err)
+	}
+
+	newArgs = append(newArgs, newFilePaths...)
+
 	// Add all missing packages to importcfg file.
-	err = addMissingPkgs(importCfg, fileImports)
+	err = addMissingPkgs(importCfg, slices.Concat(filesImports...))
 	if err != nil {
 		panic(err)
 	}
@@ -176,7 +194,12 @@ func Process(modifier Modifier, opts ...Option) {
 
 	// Run the the original `go tool compile` command with new arguments
 	// to propagate our changes to the compiler.
-	runCommand(newArgs[toolOffset], newArgs[argsOffset:])
+	err = runCommand(newArgs[toolOffset], newArgs[argsOffset:])
+	if err != nil {
+		// exitOnError terminates the process, so deferred cleanup would not run.
+		os.RemoveAll(tmpDir)
+		exitOnError(err)
+	}
 	config.logger.Printf("Package compiled")
 }
 
@@ -200,8 +223,10 @@ func hasNonRelevantFiles(args []string, files []string, wd string) bool {
 		return true
 	}
 
+	// Compare against wd with a trailing separator, so that /proj does not match /proj-other.
+	projectPrefix := wd + string(filepath.Separator)
 	hasNonProjectFile := slices.ContainsFunc(files, func(s string) bool {
-		return !strings.HasPrefix(s, wd)
+		return !strings.HasPrefix(s, projectPrefix)
 	})
 
 	return hasNonProjectFile
@@ -216,10 +241,7 @@ func extractFilesFromPack(args []string) ([]string, int, error) {
 		return nil, 0, fmt.Errorf("-pack flag is not found")
 	}
 
-	filesCount := len(args) - packIndex
-	files := make([]string, filesCount)
 	goFiles := args[packIndex+1:]
-	copy(files, goFiles)
 
 	goFilesIndex := packIndex + argsOffset + 1
 
@@ -283,15 +305,9 @@ func addMissingPkgToImportcfg(importcfgPath string, pkgName string, pkgPath stri
 // with its relevant imports (used for patching importcfg).
 //
 // It automatically manages import resolution and injects missing imports required
-// by modifications. It also prepends a `/*line*/` directive to preserve accurate
-// stack traces that refer back to the original file.
-func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.ImportSpec, error) {
-	// Obtain a packages resolver to automatically manage trivial and non-trivial imports.
-	resolver, err := packagesResolver()
-	if err != nil {
-		return "", nil, err
-	}
-
+// by modifications. It also adds `/*line*/` directives to preserve accurate
+// compiler errors and stack traces that refer back to the original file.
+func processFile(tmpDir string, path string, modifier Modifier, resolver *packageNameResolver) (string, []*dst.ImportSpec, error) {
 	// NewRestorerWithImports ensures newly required imports (e.g., "fmt")
 	// are added to the file if they're used in the injected code but
 	// missing from the original source.
@@ -310,11 +326,16 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 	// Make the necessary changes to the AST file
 	f = modifier.Modify(f, decorator, restorer)
 
+	// Restoring the file reflows it (added imports, injected code), so positions
+	// of the original nodes no longer match the original file without directives.
+	addLineDirectives(f, decorator)
+
 	var out bytes.Buffer
 
 	// Add a /*line */ directive so that stack traces and caller info
 	// point to the original source file instead of the generated one.
 	// Especially important since the generated file is deleted after compilation.
+	// It covers the package clause and imports; the rest is covered by [addLineDirectives].
 	_, err = out.WriteString(fmt.Sprintf("/*line %s:1:1*/\n", path))
 	if err != nil {
 		return "", nil, fmt.Errorf("appending line directive: %w", err)
@@ -340,6 +361,79 @@ func processFile(tmpDir string, path string, modifier Modifier) (string, []*dst.
 	return newFileName, f.Imports, nil
 }
 
+// addLineDirectives prefixes every top-level declaration and every statement of a block or
+// case body that comes from the original source with a line directive pointing at its
+// original position. Code injected by the modifier has no original position and inherits the
+// position of the nearest preceding directive, so it is attributed to the place where it was injected.
+func addLineDirectives(f *dst.File, dec *decorator.Decorator) {
+	for _, decl := range f.Decls {
+		pos, ok := originalPosition(decl, dec)
+		if !ok {
+			continue
+		}
+
+		decs := decl.Decorations()
+		if decs.Before == dst.None {
+			decs.Before = dst.NewLine
+		}
+		// Top-level declarations start at column 1, where the //line form is valid:
+		// it sets the position of the first character of the next line.
+		// Appended after existing start decorations (e.g. doc comments), so it immediately precedes the declaration.
+		decs.Start.Append(fmt.Sprintf("//line %s:%d:%d", pos.Filename, pos.Line, pos.Column))
+	}
+
+	dst.Inspect(f, func(n dst.Node) bool {
+		switch n := n.(type) {
+		case *dst.BlockStmt:
+			addStmtLineDirectives(n.List, dec)
+		case *dst.CaseClause:
+			addStmtLineDirectives(n.Body, dec)
+		case *dst.CommClause:
+			addStmtLineDirectives(n.Body, dec)
+		}
+
+		return true
+	})
+}
+
+// addStmtLineDirectives prefixes statements with a `/*line*/` directive, which, unlike `//line`,
+// is valid in indented code: it sets the position of the character right after the comment.
+func addStmtLineDirectives(stmts []dst.Stmt, dec *decorator.Decorator) {
+	for _, stmt := range stmts {
+		pos, ok := originalPosition(stmt, dec)
+		if !ok {
+			continue
+		}
+
+		decs := stmt.Decorations()
+		// Without a line break before the statement, the printer moves the comment to the end
+		// of the previous line, where the directive would describe the line break instead.
+		if decs.Before == dst.None {
+			decs.Before = dst.NewLine
+		}
+
+		// The printer separates the comment from the statement with a single space,
+		// so the directive describes that space, one column before the statement.
+		directive := fmt.Sprintf("/*line %s:%d:%d*/", pos.Filename, pos.Line, pos.Column-1)
+		if pos.Column <= 1 {
+			// There is no column before the first one: leave the column unknown instead.
+			directive = fmt.Sprintf("/*line %s:%d*/", pos.Filename, pos.Line)
+		}
+		decs.Start.Append(directive)
+	}
+}
+
+// originalPosition returns the position of n in the original source file.
+// Nodes created by the modifier have no original position.
+func originalPosition(n dst.Node, dec *decorator.Decorator) (token.Position, bool) {
+	astNode, ok := dec.Ast.Nodes[n]
+	if !ok {
+		return token.Position{}, false
+	}
+
+	return dec.Fset.Position(astNode.Pos()), true
+}
+
 // dstFile parses the Go source file at the given path and returns a
 // decorated dst.File, ready for further AST modifications.
 func dstFile(path string, dec *decorator.Decorator) (*dst.File, error) {
@@ -356,41 +450,95 @@ func dstFile(path string, dec *decorator.Decorator) (*dst.File, error) {
 	return f, err
 }
 
-// packagesResolver builds a [guess.RestorerResolver] that can be passed to
-// [NewDecoratorWithImports] and [NewRestorerWithImports] to automatically handle
-// imports when modifying a file’s AST.
-func packagesResolver() (guess.RestorerResolver, error) {
-	packagesMap, err := loadPackages()
+// packageNameResolver resolves import paths to package names for [decorator.NewDecoratorWithImports]
+// and [decorator.NewRestorerWithImports]. Names are needed whenever a package name differs from the
+// last element of its import path. It is safe for concurrent use.
+type packageNameResolver struct {
+	mu    sync.Mutex
+	names map[string]string
+}
+
+// newPackageNameResolver creates a resolver preloaded with the names of all packages imported by files,
+// using a single `go list` call. Imports added by modifications are resolved lazily in [ResolvePackage].
+func newPackageNameResolver(files []string) (*packageNameResolver, error) {
+	fset := token.NewFileSet()
+	var importPaths []string
+	for _, file := range files {
+		f, err := parser.ParseFile(fset, file, nil, parser.ImportsOnly)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, spec := range f.Imports {
+			importPath := strings.Trim(spec.Path.Value, `"`)
+			// "C" is the cgo pseudo-package, unknown to `go list`.
+			if importPath != "C" && !slices.Contains(importPaths, importPath) {
+				importPaths = append(importPaths, importPath)
+			}
+		}
+	}
+
+	names, err := loadPackageNames(importPaths)
 	if err != nil {
 		return nil, fmt.Errorf("failed composing packages resolver: %w", err)
 	}
 
-	resolver := guess.WithMap(packagesMap)
-
-	return resolver, nil
+	return &packageNameResolver{names: names}, nil
 }
 
-// loadPackages retrieves all Go packages under the current module using "./...".
-// It returns a map of import paths to package names, which is later used
-// to resolve non-trivial imports when modifying source files.
-func loadPackages() (map[string]string, error) {
-	loadedPackages, err := packages.Load(&packages.Config{
-		// Dir:  filepath.Dir(path),
-		Mode: packages.NeedName | packages.NeedImports | packages.NeedFiles},
-		"./...",
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed loading packages: %w", err)
+// ResolvePackage returns the name of the package with the given import path.
+// Packages unknown to `go list` fall back to guessing the name from the import path.
+func (r *packageNameResolver) ResolvePackage(importPath string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if name, ok := r.names[importPath]; ok {
+		return name, nil
 	}
 
-	pkgs := make(map[string]string)
-	for _, loadedPkg := range loadedPackages {
-		for _, imp := range loadedPkg.Imports {
-			pkgs[imp.PkgPath] = imp.Name
+	names, err := loadPackageNames([]string{importPath})
+	if err != nil {
+		return "", err
+	}
+
+	name, ok := names[importPath]
+	if !ok {
+		name, err = guess.New().ResolvePackage(importPath)
+		if err != nil {
+			return "", err
+		}
+	}
+	r.names[importPath] = name
+
+	return name, nil
+}
+
+// loadPackageNames returns a map of import paths to package names.
+// `go list -find` only locates the packages, without resolving their dependencies, which keeps it cheap.
+// Packages that cannot be found are omitted.
+func loadPackageNames(importPaths []string) (map[string]string, error) {
+	names := make(map[string]string, len(importPaths))
+	if len(importPaths) == 0 {
+		return names, nil
+	}
+
+	args := append([]string{"list", "-e", "-find", "-f", "{{.ImportPath}} {{.Name}}", "--"}, importPaths...)
+	cmd := exec.Command("go", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("running %q: %w: %s", cmd.Args, err, stderr.String())
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		importPath, name, _ := strings.Cut(line, " ")
+		if name != "" {
+			names[importPath] = name
 		}
 	}
 
-	return pkgs, nil
+	return names, nil
 }
 
 // ResolvePkg attempts to collect and return the paths to the compiled Go packages
@@ -510,41 +658,56 @@ func output(fullName string, out io.Reader) {
 		}
 	}
 
-	err := os.WriteFile(fullName, txt, os.ModePerm)
+	err := os.WriteFile(fullName, txt, 0o644)
 	if err != nil {
 		panic(err)
 	}
 }
 
 // runCommand executes the specified Go toolchain command with the provided arguments.
-func runCommand(tool string, args []string) {
+// The command's stdout and stderr are forwarded, so its diagnostics are already printed when it fails.
+func runCommand(tool string, args []string) error {
 	cmd := exec.Command(tool, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+
+	return cmd.Run()
 }
 
-// getwd retrieves the working directory of the current Go module by running `go env GOMOD`.
-// It checks if the `GOMOD` environment variable is set, which indicates the location of the Go module file.
-// If the `GOMOD` variable is valid, it returns the directory containing the Go module file.
-// If the `GOMOD` value is empty or invalid, it falls back to using the current working directory
-// and returns an error indicating that the module directory could not be determined.
+// exitOnError terminates the process if err is not nil.
+// A failed toolchain command exits with its own exit code, since it has already reported the problem;
+// any other error is printed and exits with code 1.
+func exitOnError(err error) {
+	if err == nil {
+		return
+	}
+
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() > 0 {
+		os.Exit(exitErr.ExitCode())
+	}
+
+	fmt.Fprintln(os.Stderr, err)
+	os.Exit(1)
+}
+
+// getwd returns the root directory of the main Go module: the nearest directory containing go.mod,
+// starting from the current working directory. The Go toolchain runs every tool in the directory
+// where `go build` was invoked, so this is the module being built, same as reported by `go env GOMOD`,
+// without spawning a `go` process for every tool invocation.
 func getwd() (string, error) {
-	cmd := exec.Command("go", "env", "GOMOD")
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("runnning %q: %w", cmd.Args, err)
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("getting working directory: %w", err)
 	}
 
-	if goMod := strings.TrimSpace(stdout.String()); goMod != "" && goMod != os.DevNull {
-		return filepath.Dir(goMod), nil
+	for dir := wd; ; dir = filepath.Dir(dir) {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+
+		if filepath.Dir(dir) == dir {
+			return "", fmt.Errorf("in %q: go.mod not found", wd)
+		}
 	}
-
-	wd, _ := os.Getwd()
-
-	return "", fmt.Errorf("in %q: %s", wd, "`go env GOMOD` returned a blank string")
 }

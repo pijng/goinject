@@ -47,6 +47,14 @@ func main() {
 
 In this example, `CustomModifier` is a struct that satisfies the `Modifier` interface. It implements the `Modify` method, where you can define your custom modification logic.
 
+## Imports added by modifications
+
+goinject makes newly added imports visible to the compiler of the modified package, but it does not change the linker's dependency graph. Every package your modifications import must already be a dependency of the final binary, otherwise linking fails with `cannot find package <pkg> (using -importcfg)`. The usual way to guarantee this is a blank import in the target's `main` package:
+
+```go
+import _ "github.com/you/your-preprocessor-runtime"
+```
+
 ## Demonstration
 
 - [go_otel_auto_instrument](https://github.com/pijng/go_otel_auto_instrument): `go_otel_auto_instrument` is a preprocessor that automatically inject Opentelemtry tracing into your Go code.
